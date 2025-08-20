@@ -1,0 +1,74 @@
+menu "Greenhouse ESP DShot ESC Controller"
+
+config FAN_COUNT
+    int "Number of fans (ESCs) to control"
+    range 1 8
+    default 2
+    help
+      Set how many fans (ESCs) this device will control. Each fan uses one DShot GPIO.
+
+config FAN_INDEX_START
+    int "First fan index (for multi-node setups)"
+    range 1 8
+    default 1
+    help
+      The index of the first fan this node controls (e.g., 1 for fans 1-2, 3 for fans 3-4).
+
+config DSHOT_GPIO
+    string "DShot GPIOs (comma-separated, one per fan)"
+    default "5,7"
+    help
+      Comma-separated list of GPIOs for DShot output, one per fan (e.g., 5,7 for two fans).
+
+config MIN_SPIN_PCT
+    int "Minimum spin percentage (to prevent stalls)"
+    range 1 100
+    default 15
+    help
+      Minimum percentage to apply when fan is ON (prevents stalling at low throttle).
+
+config RAMP_STEP_PCT
+    int "Ramp step percentage (smooth ramping)"
+    range 1 20
+    default 3
+    help
+      Step size for ramping fan speed up/down.
+
+config RAMP_TICK_MS
+    int "Ramp tick interval (ms)"
+    range 1 100
+    default 20
+    help
+      Interval in milliseconds between ramp steps.
+
+config WIFI_SSID
+    string "Wi‑Fi SSID"
+    default "Tent"
+    help
+      SSID for Wi‑Fi station mode.
+
+config WIFI_PASS
+    string "Wi‑Fi Password"
+    default "1LoveW33D"
+    help
+      Password for Wi‑Fi station mode.
+
+config MQTT_BROKER_URI
+    string "MQTT broker URI"
+    default "mqtt://192.168.53.174"
+    help
+      Broker URI like mqtt://host or mqtts://host.
+
+config MQTT_USERNAME
+    string "MQTT username"
+    default "greenhouse_esp"
+    help
+      Username for MQTT authentication.
+
+config MQTT_PASSWORD
+    string "MQTT password"
+    default "1LoveW33D"
+    help
+      Password for MQTT authentication.
+
+endmenu

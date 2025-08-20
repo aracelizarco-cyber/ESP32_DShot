@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "dshot_esc_encoder.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+    esp_driver_rmt
+    esp_driver_gpio
+        esp_wifi
+        esp_netif
+        nvs_flash
+        mqtt
+        esp_event
+        esp_timer
+)
