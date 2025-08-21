@@ -31,12 +31,8 @@
 #include "dshot_esc_encoder.h"
 
 #include "sdkconfig.h"
-#ifndef CONFIG_WIFI_SSID
-#define CONFIG_WIFI_SSID "Tent"
-#endif
-#ifndef CONFIG_WIFI_PASS
-#define CONFIG_WIFI_PASS "1LoveW33D"
-#endif
+#define WIFI_SSID "Tent"
+#define WIFI_PASS "1LoveW33D"
 #ifndef CONFIG_MQTT_BROKER_URI
 #define CONFIG_MQTT_BROKER_URI "mqtt://192.168.53.174"
 #endif
@@ -113,7 +109,10 @@ typedef struct {
     // Ramping/control state
     uint8_t current_pct;   // last applied percentage (0..100)
     uint8_t target_pct;    // desired percentage (0..100)
+    uint8_t last_reported_pct; // last percentage published to MQTT (for UI responsiveness)
     uint32_t last_dshot;   // last applied raw DShot value + telemetry bit (composite)
+    uint64_t last_tx_us;   // last time we kicked the TX (for watchdog refresh)
+    uint32_t rmt_refresh_count; // count of periodic refreshes performed
 } motor_ctx_t;
 
 static motor_ctx_t motors[8] = {0};
@@ -148,27 +147,36 @@ static void motor_apply(motor_ctx_t *m)
         m->throttle.telemetry_req = false;
     }
     uint32_t composite = ((uint32_t)m->throttle.throttle << 1) | (m->throttle.telemetry_req ? 1u : 0u);
-    if (composite == m->last_dshot) {
+    // Watchdog: if same value, refresh at least every 1000ms to recover wedged TX
+    uint64_t now = esp_timer_get_time();
+    bool need_refresh = (now - m->last_tx_us) > 1000ULL * 1000ULL; // 1s
+    if (composite == m->last_dshot && !need_refresh) {
         return;
+    }
+    if (composite == m->last_dshot && need_refresh) {
+        // Only count when we refresh the same value for health/observability
+        m->rmt_refresh_count++;
     }
     rmt_transmit_config_t tx_cfg = {
         .loop_count = -1, // repeat until we re-enable
     };
     if (m->active) {
         // Cleanly stop the previous infinite loop before updating
-        ESP_ERROR_CHECK(rmt_disable(m->chan));
-        // After disabling, ensure TX engine considers previous transaction completed
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(m->chan, portMAX_DELAY));
+        (void)rmt_disable(m->chan);
+        // Ensure previous transaction is fully stopped
+        (void)rmt_tx_wait_all_done(m->chan, portMAX_DELAY);
         // Reset the encoder state machine to start fresh
         if (m->active_enc) {
             rmt_encoder_reset(m->active_enc);
         }
     }
-    rmt_encoder_handle_t enc = m->active_enc ? m->active_enc : m->enc600;
+    // Enable before transmit (required after disable or first start)
     ESP_ERROR_CHECK(rmt_enable(m->chan));
+    rmt_encoder_handle_t enc = m->active_enc ? m->active_enc : m->enc600;
     ESP_ERROR_CHECK(rmt_transmit(m->chan, enc, &m->throttle, sizeof(m->throttle), &tx_cfg));
     m->active = true;
     m->last_dshot = composite;
+    m->last_tx_us = now;
 }
 
 // (Locked apply removed)
@@ -227,6 +235,37 @@ static void publish_states(void)
         esp_mqtt_client_publish(mqtt, topic_state, state, 0, 1, true);
         snprintf(buf, sizeof(buf), "%u", pct);
         esp_mqtt_client_publish(mqtt, topic_pct, buf, 0, 1, true);
+    }
+}
+
+// Publish a single fan's state/percentage quickly (non-retained) for UI responsiveness
+static void publish_one_state_fast(int idx)
+{
+    if (!mqtt || !s_mqtt_connected) return;
+    if (idx < 0 || idx >= fan_count) return;
+    int fan_idx = fan_index_start + idx;
+    uint8_t pct = motors[idx].current_pct;
+    const char *state = (pct > 0) ? "ON" : "OFF";
+    char topic_state[64];
+    char topic_pct[64];
+    char buf[16];
+    snprintf(topic_state, sizeof(topic_state), "greenhouse_esp/fan%d/state", fan_idx);
+    snprintf(topic_pct, sizeof(topic_pct), "greenhouse_esp/fan%d/percentage", fan_idx);
+    esp_mqtt_client_publish(mqtt, topic_state, state, 0, 0, false);
+    snprintf(buf, sizeof(buf), "%u", pct);
+    esp_mqtt_client_publish(mqtt, topic_pct, buf, 0, 0, false);
+}
+
+static void publish_metrics(void)
+{
+    if (!mqtt || !s_mqtt_connected) return;
+    char buf[16];
+    for (int i = 0; i < fan_count; ++i) {
+        int fan_idx = fan_index_start + i;
+        char topic_ref[80];
+        snprintf(topic_ref, sizeof(topic_ref), "greenhouse_esp/fan%d/rmt_refresh_count", fan_idx);
+    snprintf(buf, sizeof(buf), "%" PRIu32, motors[i].rmt_refresh_count);
+        esp_mqtt_client_publish(mqtt, topic_ref, buf, 0, 1, true);
     }
 }
 
@@ -334,10 +373,14 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     wifi_config_t wifi_config = { 0 };
-    strlcpy((char *)wifi_config.sta.ssid, CONFIG_WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, CONFIG_WIFI_PASS, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_UNSPECIFIED;
+    strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password));
+    // Allow WPA/WPA2; avoid forcing WPA3/SAE to reduce AUTH/HANDSHAKE issues on some APs
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    wifi_config.sta.pmf_cfg.required = false; // PMF optional
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -346,6 +389,8 @@ static void wifi_init_sta(void)
     // Improve latency/reliability of TCP/MQTT by disabling Wi‑Fi power save
     // (can otherwise cause sporadic connect/select timeouts on some APs)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    // Boost TX power for link robustness (units: 0.25 dBm, 84 => 21 dBm max)
+    (void)esp_wifi_set_max_tx_power(84);
 
     ESP_LOGI(TAG, "wifi_init_sta finished, waiting for IP...");
 }
@@ -366,6 +411,9 @@ static void mqtt_start(void)
     .credentials.username = CONFIG_MQTT_USERNAME,
     .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
         .credentials.client_id = client_id,
+        .session.keepalive = 30,
+        .network.reconnect_timeout_ms = 3000,
+        .network.timeout_ms = 5000,
         .session.last_will = {
             .topic = avail_topic,
             .msg = "offline",
@@ -391,11 +439,32 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             ESP_LOGI(TAG, "Wi‑Fi connected to AP");
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             break;
-        case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGW(TAG, "Wi‑Fi disconnected, retrying...");
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+            const char *reason_str = "";
+            if (disc) {
+                switch (disc->reason) {
+                    case 1: reason_str = "UNSPECIFIED"; break;
+                    case 2: reason_str = "AUTH_EXPIRE"; break;
+                    case 3: reason_str = "AUTH_LEAVE"; break;
+                    case 4: reason_str = "ASSOC_EXPIRE"; break;
+                    case 5: reason_str = "ASSOC_TOOMANY"; break;
+                    case 6: reason_str = "NOT_AUTHED"; break;
+                    case 7: reason_str = "NOT_ASSOCED"; break;
+                    case 8: reason_str = "ASSOC_LEAVE"; break;
+                    case 9: reason_str = "ASSOC_NOT_AUTHED"; break;
+                    case 201: reason_str = "NO_AP_FOUND"; break;
+                    case 202: reason_str = "AUTH_FAIL"; break;
+                    case 203: reason_str = "ASSOC_FAIL"; break;
+                    case 204: reason_str = "HANDSHAKE_TIMEOUT"; break;
+                    case 205: reason_str = "CONNECTION_FAIL"; break; // often WPA/PMF/SAE mismatch
+                    default: reason_str = "OTHER"; break;
+                }
+            }
+            ESP_LOGW(TAG, "Wi‑Fi disconnected, reason=%d (%s), retrying...", disc ? disc->reason : -1, reason_str);
             esp_wifi_connect();
             xEventGroupClearBits(s_wifi_event_group, WIFI_GOT_IP_BIT);
-            break;
+            break; }
         default:
             break;
         }
@@ -433,7 +502,10 @@ static void dshot_init_motor(motor_ctx_t *m, int gpio, uint32_t baud)
     m->throttle.telemetry_req = false;
     m->current_pct = 0;
     m->target_pct = 0;
+    m->last_reported_pct = 255; // force first publish on change
     m->last_dshot = 0;
+    m->last_tx_us = 0;
+    m->rmt_refresh_count = 0;
     motor_apply(m);
 }
 
@@ -452,6 +524,21 @@ static void motor_ramp_task(void *arg)
                 if (cur > 100) cur = 100;
                 motors[i].current_pct = (uint8_t)cur;
                 motors[i].throttle.throttle = pct_to_dshot((uint8_t)cur);
+                motor_apply(&motors[i]);
+                // Publish promptly when percentage changes meaningfully or crosses ON/OFF
+                uint8_t last = motors[i].last_reported_pct;
+                bool crossing_on = (last == 0 && motors[i].current_pct > 0);
+                bool crossing_off = (last > 0 && motors[i].current_pct == 0);
+                bool reached_target = (motors[i].current_pct == motors[i].target_pct);
+                int diff = (int)motors[i].current_pct - (int)last;
+                if (diff < 0) diff = -diff;
+                bool step_change = (last == 255) || (diff >= 5);
+                if (crossing_on || crossing_off || step_change || reached_target) {
+                    publish_one_state_fast(i);
+                    motors[i].last_reported_pct = motors[i].current_pct;
+                }
+            } else {
+                // Even if target is steady, periodically refresh the stream
                 motor_apply(&motors[i]);
             }
         }
@@ -499,6 +586,7 @@ void app_main(void)
     while (1) {
         if (mqtt && s_mqtt_connected) {
             publish_states();
+            publish_metrics();
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
