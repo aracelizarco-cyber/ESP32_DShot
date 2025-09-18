@@ -1,74 +1,158 @@
 menu "Greenhouse ESP DShot ESC Controller"
 
-config FAN_COUNT
-    int "Number of fans (ESCs) to control"
-    range 1 8
-    default 2
-    help
-      Set how many fans (ESCs) this device will control. Each fan uses one DShot GPIO.
+    menu "Network Configuration"
+        
+        config WIFI_SSID
+            string "Wi‑Fi SSID"
+            default ""
+            help
+              SSID for Wi‑Fi station mode. Leave empty to use NVS provisioning.
+              For security, consider using esp_wifi_set_config() with NVS storage
+              instead of hardcoding credentials.
 
-config FAN_INDEX_START
-    int "First fan index (for multi-node setups)"
-    range 1 8
-    default 1
-    help
-      The index of the first fan this node controls (e.g., 1 for fans 1-2, 3 for fans 3-4).
+        config WIFI_PASS
+            string "Wi‑Fi Password"
+            default ""
+            help
+              Password for Wi‑Fi station mode. Leave empty to use NVS provisioning.
+              For security, consider using esp_wifi_set_config() with NVS storage
+              instead of hardcoding credentials.
 
-config DSHOT_GPIO
-    string "DShot GPIOs (comma-separated, one per fan)"
-    default "5,7"
-    help
-      Comma-separated list of GPIOs for DShot output, one per fan (e.g., 5,7 for two fans).
+        config MQTT_BROKER_URI
+            string "MQTT broker URI"
+            default "mqtt://10.10.10.1"
+            help
+              Broker URI like mqtt://host:1883 or mqtts://host:8883.
+              Default points to a common greenhouse network gateway.
 
-config MIN_SPIN_PCT
-    int "Minimum spin percentage (to prevent stalls)"
-    range 1 100
-    default 15
-    help
-      Minimum percentage to apply when fan is ON (prevents stalling at low throttle).
+        config MQTT_USERNAME
+            string "MQTT username"
+            default ""
+            help
+              Username for MQTT authentication. Leave empty if no auth required.
 
-config RAMP_STEP_PCT
-    int "Ramp step percentage (smooth ramping)"
-    range 1 20
-    default 3
-    help
-      Step size for ramping fan speed up/down.
+        config MQTT_PASSWORD
+            string "MQTT password"
+            default ""
+            help
+              Password for MQTT authentication. Leave empty if no auth required.
+              For security, consider using NVS storage instead of hardcoding.
 
-config RAMP_TICK_MS
-    int "Ramp tick interval (ms)"
-    range 1 100
-    default 20
-    help
-      Interval in milliseconds between ramp steps.
+    endmenu
 
-config WIFI_SSID
-    string "Wi‑Fi SSID"
-    default "Tent"
-    help
-      SSID for Wi‑Fi station mode.
+    menu "Fan Configuration"
 
-config WIFI_PASS
-    string "Wi‑Fi Password"
-    default "1LoveW33D"
-    help
-      Password for Wi‑Fi station mode.
+        config FAN_COUNT
+            int "Number of fans (ESCs) to control"
+            range 1 8
+            default 2
+            help
+              Set how many fans (ESCs) this device will control. Each fan uses one DShot GPIO.
 
-config MQTT_BROKER_URI
-    string "MQTT broker URI"
-    default "mqtt://192.168.53.174"
-    help
-      Broker URI like mqtt://host or mqtts://host.
+        config FAN_INDEX_START
+            int "First fan index (for multi-node setups)"
+            range 1 8
+            default 1
+            help
+              The index of the first fan this node controls (e.g., 1 for fans 1-2, 3 for fans 3-4).
+              This allows multiple ESP32 nodes to control different fan ranges.
 
-config MQTT_USERNAME
-    string "MQTT username"
-    default "greenhouse_esp"
-    help
-      Username for MQTT authentication.
+        config DSHOT_GPIOS
+            string "DShot GPIOs (comma-separated, one per fan)"
+            default "5,7"
+            help
+              Comma-separated list of GPIOs for DShot output, one per fan (e.g., "5,7" for two fans).
+              Ensure GPIOs are available and not used by other peripherals.
 
-config MQTT_PASSWORD
-    string "MQTT password"
-    default "1LoveW33D"
-    help
-      Password for MQTT authentication.
+        config MIN_SPIN_PCT
+            int "Minimum spin percentage (to prevent stalls)"
+            range 0 50
+            default 15
+            help
+              Minimum percentage to apply when fan is ON (prevents stalling at low throttle).
+              Set to 0 to allow fans to be completely stopped.
+
+        config RAMP_STEP_PCT
+            int "Ramp step percentage (smooth ramping)"
+            range 1 20
+            default 3
+            help
+              Step size for ramping fan speed up/down. Smaller values give smoother transitions
+              but slower response. Larger values give faster response but less smooth operation.
+
+        config RAMP_TICK_MS
+            int "Ramp tick interval (ms)"
+            range 5 200
+            default 20
+            help
+              Interval in milliseconds between ramp steps. Shorter intervals give smoother
+              ramping but use more CPU. Longer intervals are more efficient but less smooth.
+
+    endmenu
+
+    menu "DShot Protocol Configuration"
+
+        choice DSHOT_SPEED
+            prompt "DShot protocol speed"
+            default DSHOT_SPEED_600
+            help
+              Select the DShot protocol speed. Higher speeds provide better resolution
+              but require more precise timing and may not work with all ESCs.
+
+            config DSHOT_SPEED_150
+                bool "DShot150 (150 kbit/s)"
+            config DSHOT_SPEED_300
+                bool "DShot300 (300 kbit/s)"
+            config DSHOT_SPEED_600
+                bool "DShot600 (600 kbit/s)"
+            config DSHOT_SPEED_1200
+                bool "DShot1200 (1200 kbit/s)"
+        endchoice
+
+        config DSHOT_SPEED_VALUE
+            int
+            default 150 if DSHOT_SPEED_150
+            default 300 if DSHOT_SPEED_300
+            default 600 if DSHOT_SPEED_600
+            default 1200 if DSHOT_SPEED_1200
+
+        config TLM_ENABLE
+            bool "Enable DShot telemetry"
+            default n
+            help
+              Enable DShot telemetry to receive RPM and other data from ESCs.
+              Note: Telemetry is currently not fully implemented in this version.
+
+    endmenu
+
+    menu "Safety and Failsafe"
+
+        config FAILSAFE_MS
+            int "Failsafe timeout (ms)"
+            range 100 5000
+            default 1500
+            help
+              Time in milliseconds after which fans will be stopped if no valid
+              control commands are received. This is a safety feature to prevent
+              runaway fans in case of communication failure.
+
+        config REQUIRE_ARM
+            bool "Require arming before fan operation"
+            default y
+            help
+              When enabled, fans will not operate until the system is explicitly armed
+              via MQTT command. This provides an additional safety layer for greenhouse
+              operations where fans control critical environmental conditions.
+
+        config ARM_TIMEOUT_S
+            int "Auto-disarm timeout (seconds)"
+            depends on REQUIRE_ARM
+            range 60 3600
+            default 300
+            help
+              Time in seconds after which the system will automatically disarm if no
+              activity is detected. Set to 0 to disable auto-disarm.
+
+    endmenu
 
 endmenu
