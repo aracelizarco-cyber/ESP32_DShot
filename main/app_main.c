@@ -277,7 +277,7 @@ static void ha_publish_discovery(void)
         
         snprintf(payload, sizeof(payload),
                  "{"
-                 "\"name\":\"Tent Fan %d\"," 
+                 "\"name\":\"Fan %d\"," 
                  "\"unique_id\":\"%s\"," 
                  "\"command_topic\":\"greenhouse_esp/fan%d/set\"," 
                  "\"state_topic\":\"greenhouse_esp/fan%d/state\"," 
