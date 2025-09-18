@@ -43,19 +43,19 @@ config RAMP_TICK_MS
 
 config WIFI_SSID
     string "Wi‑Fi SSID"
-    default "Tent"
+    default ""
     help
       SSID for Wi‑Fi station mode.
 
 config WIFI_PASS
     string "Wi‑Fi Password"
-    default "1LoveW33D"
+    default ""
     help
       Password for Wi‑Fi station mode.
 
 config MQTT_BROKER_URI
     string "MQTT broker URI"
-    default "mqtt://192.168.53.174"
+    default "mqtt://192.168.1.100"
     help
       Broker URI like mqtt://host or mqtts://host.
 
@@ -67,8 +67,21 @@ config MQTT_USERNAME
 
 config MQTT_PASSWORD
     string "MQTT password"
-    default "1LoveW33D"
+    default ""
     help
       Password for MQTT authentication.
+
+config FAILSAFE_MS
+    int "Failsafe timeout (ms)"
+    range 500 10000
+    default 1500
+    help
+      Time in milliseconds without valid control command before ramping down to 0 and stopping TX.
+
+config BOOT_ARMED
+    bool "Boot in armed state"
+    default false
+    help
+      If enabled, motors will be armed at boot. If disabled, explicit arm command via MQTT is required.
 
 endmenu
