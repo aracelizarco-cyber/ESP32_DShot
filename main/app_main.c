@@ -10,11 +10,11 @@
 #include <strings.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
-//
 
 #include "esp_log.h"
 #include "esp_event.h"
@@ -26,10 +26,8 @@
 #include "mqtt_client.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
-// No UART/telemetry used
 
 #include "dshot_esc_encoder.h"
-
 #include "sdkconfig.h"
 
 // Safety and failsafe configuration
@@ -40,7 +38,6 @@
 #define CONFIG_BOOT_ARMED false
 #endif
 
-
 // Modular configuration via Kconfig (see Kconfig file)
 #ifndef CONFIG_FAN_COUNT
 #define CONFIG_FAN_COUNT 2
@@ -48,8 +45,8 @@
 #ifndef CONFIG_FAN_INDEX_START
 #define CONFIG_FAN_INDEX_START 1
 #endif
-#ifndef CONFIG_DSHOT_GPIO
-#define CONFIG_DSHOT_GPIO "5,7"
+#ifndef CONFIG_DSHOT_GPIOS
+#define CONFIG_DSHOT_GPIOS "5,7"
 #endif
 #ifndef CONFIG_MIN_SPIN_PCT
 #define CONFIG_MIN_SPIN_PCT 15
@@ -60,26 +57,9 @@
 #ifndef CONFIG_RAMP_TICK_MS
 #define CONFIG_RAMP_TICK_MS 20
 #endif
-// Parse DSHOT GPIOs from config string
-#include <stdlib.h>
-static int dshot_gpios[8] = {0};
-static int fan_count = CONFIG_FAN_COUNT;
-static int fan_index_start = CONFIG_FAN_INDEX_START;
-static int min_spin_pct = CONFIG_MIN_SPIN_PCT;
-static int ramp_step_pct = CONFIG_RAMP_STEP_PCT;
-static int ramp_tick_ms = CONFIG_RAMP_TICK_MS;
-
-static void parse_dshot_gpios(void) {
-    const char *str = CONFIG_DSHOT_GPIO;
-    char *copy = strdup(str);
-    char *token = strtok(copy, ",");
-    int idx = 0;
-    while (token && idx < 8) {
-        dshot_gpios[idx++] = atoi(token);
-        token = strtok(NULL, ",");
-    }
-    free(copy);
-}
+#ifndef CONFIG_MOTOR_POLE_PAIRS
+#define CONFIG_MOTOR_POLE_PAIRS 7
+#endif
 
 #if CONFIG_IDF_TARGET_ESP32H2
 #define DSHOT_ESC_RESOLUTION_HZ 32000000
@@ -92,6 +72,18 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_GOT_IP_BIT    BIT1
 static esp_netif_t *s_wifi_netif = NULL;
+
+// MQTT per-node namespace
+static char s_mac_suffix[7] = {0};       // "A1B2C3"
+static char s_base[64] = {0};            // "greenhouse_esp/A1B2C3"
+static inline void load_mac_suffix_and_base(void) {
+    if (s_mac_suffix[0] == 0) {
+        uint8_t mac[6] = {0};
+        esp_wifi_get_mac(WIFI_IF_STA, mac);
+        snprintf(s_mac_suffix, sizeof(s_mac_suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+        snprintf(s_base, sizeof(s_base), "greenhouse_esp/%s", s_mac_suffix);
+    }
+}
 
 // Forward declaration
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -113,6 +105,13 @@ typedef struct {
     uint32_t rmt_refresh_count; // count of periodic refreshes performed
 } motor_ctx_t;
 
+static int dshot_gpios[8] = {0};
+static int fan_count = CONFIG_FAN_COUNT;
+static int fan_index_start = CONFIG_FAN_INDEX_START;
+static int min_spin_pct = CONFIG_MIN_SPIN_PCT;
+static int ramp_step_pct = CONFIG_RAMP_STEP_PCT;
+static int ramp_tick_ms = CONFIG_RAMP_TICK_MS;
+
 static motor_ctx_t motors[8] = {0};
 static esp_mqtt_client_handle_t mqtt = NULL;
 // Fixed protocol: DSHOT600 only
@@ -120,20 +119,50 @@ static volatile bool s_mqtt_connected = false;
 
 // Safety and failsafe state
 static volatile bool s_system_armed = CONFIG_BOOT_ARMED;
-static volatile uint64_t s_last_command_time = 0;
+static volatile uint64_t s_last_command_time = 0; // kept for potential future use; not used for failsafe
 static volatile bool s_wifi_connected = false;
 
 // DShot frame cache for optimization (precomputed 0-100%)
 static uint16_t dshot_frame_cache[101] = {0};
 
-// (Telemetry removed)
+// Trim helper
+static inline void trim(char *s) {
+    if (!s) return;
+    // left trim
+    while (*s == ' ' || *s == '\t') memmove(s, s+1, strlen(s));
+    // right trim
+    size_t n = strlen(s);
+    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\r' || s[n-1] == '\n')) s[--n] = 0;
+}
+
+// Parse DSHOT GPIOs from config string
+static void parse_dshot_gpios(void) {
+    const char *str = CONFIG_DSHOT_GPIOS;
+    char *copy = strdup(str ? str : "");
+    if (!copy) {
+        ESP_LOGE(TAG, "Out of memory parsing DSHOT_GPIOS");
+        return;
+    }
+    char *saveptr = NULL;
+    char *token = strtok_r(copy, ",", &saveptr);
+    int idx = 0;
+    while (token && idx < 8) {
+        trim(token);
+        dshot_gpios[idx++] = atoi(token);
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+    if (fan_count > idx) {
+        ESP_LOGW(TAG, "FAN_COUNT=%d but only %d GPIOs provided; remaining motors will be disabled", fan_count, idx);
+        fan_count = idx;
+    }
+    free(copy);
+}
 
 // Initialize DShot frame cache for optimized performance
-static void init_dshot_frame_cache(void)
-{
+static void init_dshot_frame_cache(void) {
     for (int pct = 0; pct <= 100; pct++) {
         if (pct == 0) {
-            dshot_frame_cache[pct] = 48; // idle, not 0 to avoid special commands
+            dshot_frame_cache[pct] = 48; // idle (we stop TX on 0%, so this is a fallback)
         } else {
             int effective_pct = pct;
             if (effective_pct < min_spin_pct) effective_pct = min_spin_pct;
@@ -147,40 +176,21 @@ static void init_dshot_frame_cache(void)
 }
 
 // Safety check: returns true if motors should be allowed to run
-static bool safety_check(void)
-{
-    if (!s_system_armed) {
-        return false;
-    }
-    
-    // Check failsafe timeout
-    uint64_t now = esp_timer_get_time();
-    if (s_last_command_time > 0 && (now - s_last_command_time) > (CONFIG_FAILSAFE_MS * 1000ULL)) {
-        ESP_LOGW(TAG, "Failsafe timeout triggered, disarming system");
-        s_system_armed = false;
-        return false;
-    }
-    
-    // Check connectivity
-    if (!s_wifi_connected || !s_mqtt_connected) {
-        return false;
-    }
-    
+static bool safety_check(void) {
+    if (!s_system_armed) return false;
+    if (!s_wifi_connected || !s_mqtt_connected) return false;
     return true;
 }
 
 // Helper: map 0-100% to DShot throttle range using cache
-static uint16_t pct_to_dshot(uint8_t pct)
-{
+static uint16_t pct_to_dshot(uint8_t pct) {
     if (pct > 100) pct = 100;
     return dshot_frame_cache[pct];
 }
 
 // Stop motor RMT transmission completely
-static void motor_stop(motor_ctx_t *m)
-{
+static void motor_stop(motor_ctx_t *m) {
     if (!m || !m->chan) return;
-    
     if (m->active) {
         ESP_LOGI(TAG, "Stopping motor RMT TX on GPIO %d", m->gpio);
         (void)rmt_disable(m->chan);
@@ -193,71 +203,62 @@ static void motor_stop(motor_ctx_t *m)
     m->stopped = true;
 }
 
-// (Telemetry CRC removed)
-
-static void motor_apply(motor_ctx_t *m)
-{
+// Apply current_pct to hardware; avoid churn at steady state
+static void motor_apply(motor_ctx_t *m) {
     if (!m || !m->chan || (!m->enc600)) return;
-    
-    // Safety check - if not safe to run, stop motor
-    if (!safety_check()) {
-        if (m->current_pct > 0) {
+
+    bool safe_to_spin = safety_check();
+    uint64_t now = esp_timer_get_time();
+
+    // Determine desired throttle: always send idle (48) at 0% to keep ESC happy
+    uint16_t desired = 48;
+    if (m->current_pct > 0 && safe_to_spin) {
+        desired = pct_to_dshot(m->current_pct);
+    } else {
+        // Coerce state to idle if not safe
+        if (m->current_pct > 0 && !safe_to_spin) {
             m->current_pct = 0;
             m->target_pct = 0;
         }
-        if (!m->stopped) {
-            motor_stop(m);
-        }
-        return;
     }
-    
-    // If percentage is 0 and we're not armed, stop transmission
-    if (m->current_pct == 0 && !s_system_armed) {
-        if (!m->stopped) {
-            motor_stop(m);
-        }
-        return;
-    }
-    
-    // If we were stopped but now need to run, re-enable
-    if (m->stopped && m->current_pct > 0) {
+
+    // If we were stopped but now need to run, mark
+    if (m->stopped) {
         m->stopped = false;
     }
-    
+
     // Update throttle value
-    m->throttle.throttle = pct_to_dshot(m->current_pct);
+    m->throttle.throttle = desired;
     m->throttle.telemetry_req = false;
-    
-    // Coerce illegal 0..47 to 48 to prevent sending DShot special commands continuously
+
+    // Coerce illegal 0..47 to 48 to prevent DShot special commands
     if (m->throttle.throttle < 48) {
         m->throttle.throttle = 48;
     }
-    
+
     uint32_t composite = ((uint32_t)m->throttle.throttle << 1) | (m->throttle.telemetry_req ? 1u : 0u);
-    // Watchdog: if same value, refresh at least every 1000ms to recover wedged TX
-    uint64_t now = esp_timer_get_time();
-    bool need_refresh = (now - m->last_tx_us) > 1000ULL * 1000ULL; // 1s
-    if (composite == m->last_dshot && !need_refresh) {
+    // 'now' computed earlier
+
+    // Only re-arm TX when value changes or after a periodic refresh to keep timing stable
+    bool value_changed = (composite != m->last_dshot);
+    bool need_watchdog_refresh = (now - m->last_tx_us) > (1000ULL * 1000ULL); // 1s
+
+    if (!value_changed && !need_watchdog_refresh) {
         return;
     }
-    if (composite == m->last_dshot && need_refresh) {
-        // Only count when we refresh the same value for health/observability
+    if (!value_changed && need_watchdog_refresh) {
         m->rmt_refresh_count++;
     }
-    rmt_transmit_config_t tx_cfg = {
-        .loop_count = -1, // repeat until we re-enable
-    };
+
+    rmt_transmit_config_t tx_cfg = { .loop_count = -1 }; // continuous
+
     if (m->active) {
-        // Cleanly stop the previous infinite loop before updating
         (void)rmt_disable(m->chan);
-        // Ensure previous transaction is fully stopped
         (void)rmt_tx_wait_all_done(m->chan, portMAX_DELAY);
-        // Reset the encoder state machine to start fresh
         if (m->active_enc) {
             rmt_encoder_reset(m->active_enc);
         }
     }
-    // Enable before transmit (required after disable or first start)
     ESP_ERROR_CHECK(rmt_enable(m->chan));
     rmt_encoder_handle_t enc = m->active_enc ? m->active_enc : m->enc600;
     ESP_ERROR_CHECK(rmt_transmit(m->chan, enc, &m->throttle, sizeof(m->throttle), &tx_cfg));
@@ -266,87 +267,146 @@ static void motor_apply(motor_ctx_t *m)
     m->last_tx_us = now;
 }
 
-// (Locked apply removed)
+static void ha_publish_discovery(void) {
+    if (!mqtt) return;
+    load_mac_suffix_and_base();
 
-static void ha_publish_discovery(void)
-{
     // Availability topic per node
-    char avail_topic[64];
-    uint8_t mac[6] = {0};
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    char mac_suffix[7];
-    snprintf(mac_suffix, sizeof(mac_suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
-    snprintf(avail_topic, sizeof(avail_topic), "greenhouse_esp/status/%s", mac_suffix);
+    char avail_topic[96];
+    snprintf(avail_topic, sizeof(avail_topic), "%s/status", s_base);
+
+    // Device object shared by all entities
+    char device_obj[256];
+    snprintf(device_obj, sizeof(device_obj),
+             "\"device\":{"
+               "\"identifiers\":[\"greenhouse_esp_%s\"],"
+               "\"manufacturer\":\"Greenhouse\","
+               "\"model\":\"ESP32 DShot Fan Ctrl\","
+               "\"sw_version\":\"1.0.0\""
+             "}",
+             s_mac_suffix);
 
     // Publish system arm/disarm switch discovery
-    char sys_disc[128];
-    char sys_uniq[64];
-    snprintf(sys_disc, sizeof(sys_disc), "homeassistant/switch/greenhouse_esp_system_%s/config", mac_suffix);
-    snprintf(sys_uniq, sizeof(sys_uniq), "greenhouse_esp_system_%s", mac_suffix);
-    
-    char sys_payload[480];
-    snprintf(sys_payload, sizeof(sys_payload),
-             "{"
-             "\"name\":\"Greenhouse System Arm\"," 
-             "\"unique_id\":\"%s\"," 
-             "\"command_topic\":\"greenhouse_esp/system/arm\"," 
-             "\"state_topic\":\"greenhouse_esp/system/state\"," 
-             "\"payload_on\":\"ON\",\"payload_off\":\"OFF\"," 
-             "\"state_on\":\"ARMED\",\"state_off\":\"DISARMED\","
-             "\"availability_topic\":\"%s\","
-             "\"payload_available\":\"online\",\"payload_not_available\":\"offline\","
-             "\"icon\":\"mdi:shield-check\""
-             "}",
-             sys_uniq, avail_topic);
-    esp_mqtt_client_publish(mqtt, sys_disc, sys_payload, 0, 1, true);
+    char sys_disc[160];
+    char sys_uniq[80];
+    snprintf(sys_disc, sizeof(sys_disc), "homeassistant/switch/greenhouse_esp_system_%s/config", s_mac_suffix);
+    snprintf(sys_uniq, sizeof(sys_uniq), "greenhouse_esp_system_%s", s_mac_suffix);
 
+        int sys_len = snprintf(NULL, 0,
+                         "{"
+                             "\"name\":\"Greenhouse System Arm\"," 
+                             "\"unique_id\":\"%s\"," 
+                             "\"command_topic\":\"%s/system/arm\"," 
+                             "\"state_topic\":\"%s/system/state\"," 
+                             "\"payload_on\":\"ON\",\"payload_off\":\"OFF\"," 
+                             "\"state_on\":\"ARMED\",\"state_off\":\"DISARMED\"," 
+                             "\"availability_topic\":\"%s\"," 
+                             "\"payload_available\":\"online\",\"payload_not_available\":\"offline\"," 
+                             "\"icon\":\"mdi:shield-check\"," 
+                             "%s"
+                         "}",
+                         sys_uniq, s_base, s_base, avail_topic, device_obj);
+        if (sys_len > 0) {
+                char *sys_payload = (char *)malloc((size_t)sys_len + 1);
+                if (sys_payload) {
+                        (void)snprintf(sys_payload, (size_t)sys_len + 1,
+                         "{"
+                             "\"name\":\"Greenhouse System Arm\"," 
+                             "\"unique_id\":\"%s\"," 
+                             "\"command_topic\":\"%s/system/arm\"," 
+                             "\"state_topic\":\"%s/system/state\"," 
+                             "\"payload_on\":\"ON\",\"payload_off\":\"OFF\"," 
+                             "\"state_on\":\"ARMED\",\"state_off\":\"DISARMED\"," 
+                             "\"availability_topic\":\"%s\"," 
+                             "\"payload_available\":\"online\",\"payload_not_available\":\"offline\"," 
+                             "\"icon\":\"mdi:shield-check\"," 
+                             "%s"
+                         "}",
+                         sys_uniq, s_base, s_base, avail_topic, device_obj);
+                        esp_mqtt_client_publish(mqtt, sys_disc, sys_payload, 0, 1, true);
+                        free(sys_payload);
+                }
+        }
+
+    // Fan entities
     for (int i = 0; i < fan_count; ++i) {
         int fan_idx = fan_index_start + i;
-        char disc[128];
-    char uniq[64];
-        snprintf(disc, sizeof(disc), "homeassistant/fan/greenhouse_esp_motor%d_%s/config", fan_idx, mac_suffix);
-        snprintf(uniq, sizeof(uniq), "greenhouse_esp_motor%d_%s", fan_idx, mac_suffix);
 
-        char payload[640];
-        
-        snprintf(payload, sizeof(payload),
-                 "{"
-                 "\"name\":\"Tent Fan %d\"," 
-                 "\"unique_id\":\"%s\"," 
-                 "\"command_topic\":\"greenhouse_esp/fan%d/set\"," 
-                 "\"state_topic\":\"greenhouse_esp/fan%d/state\"," 
-                 "\"percentage_command_topic\":\"greenhouse_esp/fan%d/percentage/set\"," 
-                 "\"percentage_state_topic\":\"greenhouse_esp/fan%d/percentage\"," 
-                 "\"payload_on\":\"ON\",\"payload_off\":\"OFF\"," 
-                 "\"availability_topic\":\"%s\","
-                 "\"payload_available\":\"online\",\"payload_not_available\":\"offline\""
-                 "}",
-                 fan_idx, uniq, fan_idx, fan_idx, fan_idx, fan_idx, avail_topic);
-        esp_mqtt_client_publish(mqtt, disc, payload, 0, 1, true);
-        
+        char disc[192];
+        char uniq[96];
+        snprintf(disc, sizeof(disc), "homeassistant/fan/greenhouse_esp_motor%d_%s/config", fan_idx, s_mac_suffix);
+        snprintf(uniq, sizeof(uniq), "greenhouse_esp_motor%d_%s", fan_idx, s_mac_suffix);
+
+                int fan_len = snprintf(NULL, 0,
+                                 "{"
+                                     "\"name\":\"Tent Fan %d\"," 
+                                     "\"unique_id\":\"%s\"," 
+                                     "\"command_topic\":\"%s/fan/%d/set\"," 
+                                     "\"state_topic\":\"%s/fan/%d/state\"," 
+                                     "\"percentage_command_topic\":\"%s/fan/%d/percentage/set\"," 
+                                     "\"percentage_state_topic\":\"%s/fan/%d/percentage\"," 
+                                     "\"payload_on\":\"ON\",\"payload_off\":\"OFF\"," 
+                                     "\"availability_topic\":\"%s\"," 
+                                     "\"payload_available\":\"online\",\"payload_not_available\":\"offline\"," 
+                                     "%s"
+                                 "}",
+                                 fan_idx, uniq,
+                                 s_base, fan_idx,
+                                 s_base, fan_idx,
+                                 s_base, fan_idx,
+                                 s_base, fan_idx,
+                                 avail_topic, device_obj);
+                if (fan_len > 0) {
+                        char *payload = (char *)malloc((size_t)fan_len + 1);
+                        if (payload) {
+                                (void)snprintf(payload, (size_t)fan_len + 1,
+                                 "{"
+                                     "\"name\":\"Tent Fan %d\"," 
+                                     "\"unique_id\":\"%s\"," 
+                                     "\"command_topic\":\"%s/fan/%d/set\"," 
+                                     "\"state_topic\":\"%s/fan/%d/state\"," 
+                                     "\"percentage_command_topic\":\"%s/fan/%d/percentage/set\"," 
+                                     "\"percentage_state_topic\":\"%s/fan/%d/percentage\"," 
+                                     "\"payload_on\":\"ON\",\"payload_off\":\"OFF\"," 
+                                     "\"availability_topic\":\"%s\"," 
+                                     "\"payload_available\":\"online\",\"payload_not_available\":\"offline\"," 
+                                     "%s"
+                                 "}",
+                                 fan_idx, uniq,
+                                 s_base, fan_idx,
+                                 s_base, fan_idx,
+                                 s_base, fan_idx,
+                                 s_base, fan_idx,
+                                 avail_topic, device_obj);
+                                esp_mqtt_client_publish(mqtt, disc, payload, 0, 1, true);
+                                free(payload);
+                        }
+                }
     }
+
     // Set node online
     esp_mqtt_client_publish(mqtt, avail_topic, "online", 0, 1, true);
 }
 
-static void publish_states(void)
-{
+static void publish_states(void) {
     if (!mqtt || !s_mqtt_connected) return;
-    
-    // Publish system status
-    char sys_topic[64];
-    snprintf(sys_topic, sizeof(sys_topic), "greenhouse_esp/system/state");
+    load_mac_suffix_and_base();
+
+    // Publish system status (non-retained for UI responsiveness)
+    char sys_topic[96];
+    snprintf(sys_topic, sizeof(sys_topic), "%s/system/state", s_base);
     esp_mqtt_client_publish(mqtt, sys_topic, s_system_armed ? "ARMED" : "DISARMED", 0, 0, false);
-    
+
     char buf[16];
     for (int i = 0; i < fan_count; ++i) {
         int fan_idx = fan_index_start + i;
         uint8_t pct = motors[i].current_pct;
         const char *state = (pct > 0) ? "ON" : "OFF";
-        char topic_state[64];
-        char topic_pct[64];
-        snprintf(topic_state, sizeof(topic_state), "greenhouse_esp/fan%d/state", fan_idx);
-        snprintf(topic_pct, sizeof(topic_pct), "greenhouse_esp/fan%d/percentage", fan_idx);
+        char topic_state[96];
+        char topic_pct[96];
+        snprintf(topic_state, sizeof(topic_state), "%s/fan/%d/state", s_base, fan_idx);
+        snprintf(topic_pct, sizeof(topic_pct), "%s/fan/%d/percentage", s_base, fan_idx);
+        // retained true for steady UI
         esp_mqtt_client_publish(mqtt, topic_state, state, 0, 1, true);
         snprintf(buf, sizeof(buf), "%u", pct);
         esp_mqtt_client_publish(mqtt, topic_pct, buf, 0, 1, true);
@@ -354,48 +414,52 @@ static void publish_states(void)
 }
 
 // Publish a single fan's state/percentage quickly (non-retained) for UI responsiveness
-static void publish_one_state_fast(int idx)
-{
+static void publish_one_state_fast(int idx) {
     if (!mqtt || !s_mqtt_connected) return;
     if (idx < 0 || idx >= fan_count) return;
+    load_mac_suffix_and_base();
+
     int fan_idx = fan_index_start + idx;
     uint8_t pct = motors[idx].current_pct;
     const char *state = (pct > 0) ? "ON" : "OFF";
-    char topic_state[64];
-    char topic_pct[64];
+    char topic_state[96];
+    char topic_pct[96];
     char buf[16];
-    snprintf(topic_state, sizeof(topic_state), "greenhouse_esp/fan%d/state", fan_idx);
-    snprintf(topic_pct, sizeof(topic_pct), "greenhouse_esp/fan%d/percentage", fan_idx);
+    snprintf(topic_state, sizeof(topic_state), "%s/fan/%d/state", s_base, fan_idx);
+    snprintf(topic_pct, sizeof(topic_pct), "%s/fan/%d/percentage", s_base, fan_idx);
     esp_mqtt_client_publish(mqtt, topic_state, state, 0, 0, false);
     snprintf(buf, sizeof(buf), "%u", pct);
     esp_mqtt_client_publish(mqtt, topic_pct, buf, 0, 0, false);
 }
 
-static void publish_metrics(void)
-{
+static void publish_metrics(void) {
     if (!mqtt || !s_mqtt_connected) return;
+    load_mac_suffix_and_base();
+
     char buf[16];
     for (int i = 0; i < fan_count; ++i) {
         int fan_idx = fan_index_start + i;
-        char topic_ref[80];
-        snprintf(topic_ref, sizeof(topic_ref), "greenhouse_esp/fan%d/rmt_refresh_count", fan_idx);
-    snprintf(buf, sizeof(buf), "%" PRIu32, motors[i].rmt_refresh_count);
+        char topic_ref[128];
+        snprintf(topic_ref, sizeof(topic_ref), "%s/fan/%d/rmt_refresh_count", s_base, fan_idx);
+        snprintf(buf, sizeof(buf), "%" PRIu32, motors[i].rmt_refresh_count);
         esp_mqtt_client_publish(mqtt, topic_ref, buf, 0, 1, true);
     }
 }
 
-static void mqtt_on_message(const char *topic, const char *data, int len)
-{
+static void mqtt_on_message(const char *topic, const char *data, int len) {
     char dbg_payload[64] = {0};
     int dbg_len = len < (int)sizeof(dbg_payload)-1 ? len : (int)sizeof(dbg_payload)-1;
     memcpy(dbg_payload, data, dbg_len);
     ESP_LOGI(TAG, "MQTT RX topic='%s' payload='%s'", topic, dbg_payload);
 
-    // Update last command time for failsafe
-    s_last_command_time = esp_timer_get_time();
+    load_mac_suffix_and_base();
+
+    // Command timestamp no longer used for failsafe
 
     // Handle system arm/disarm commands
-    if (strcmp(topic, "greenhouse_esp/system/arm") == 0) {
+    char sys_arm_topic[96];
+    snprintf(sys_arm_topic, sizeof(sys_arm_topic), "%s/system/arm", s_base);
+    if (strcmp(topic, sys_arm_topic) == 0) {
         if (len >= 2 && strncasecmp(data, "ON", 2) == 0) {
             s_system_armed = true;
             ESP_LOGI(TAG, "System ARMED");
@@ -407,16 +471,16 @@ static void mqtt_on_message(const char *topic, const char *data, int len)
                 motors[i].target_pct = 0;
             }
         }
-        publish_states();
+        publish_states(); // update retained DISARMED/ARMED immediately
         return;
     }
 
     for (int i = 0; i < fan_count; ++i) {
         int fan_idx = fan_index_start + i;
-        char set_topic[64];
-        char pct_set_topic[64];
-        snprintf(set_topic, sizeof(set_topic), "greenhouse_esp/fan%d/set", fan_idx);
-        snprintf(pct_set_topic, sizeof(pct_set_topic), "greenhouse_esp/fan%d/percentage/set", fan_idx);
+        char set_topic[96];
+        char pct_set_topic[96];
+        snprintf(set_topic, sizeof(set_topic), "%s/fan/%d/set", s_base, fan_idx);
+        snprintf(pct_set_topic, sizeof(pct_set_topic), "%s/fan/%d/percentage/set", s_base, fan_idx);
 
         if (strcmp(topic, set_topic) == 0) {
             if (len >= 2 && strncasecmp(data, "ON", 2) == 0) {
@@ -442,59 +506,53 @@ static void mqtt_on_message(const char *topic, const char *data, int len)
     }
 }
 
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
-{
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
     switch (event_id) {
-    case MQTT_EVENT_CONNECTED:
+    case MQTT_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "MQTT connected");
         s_mqtt_connected = true;
+        mqtt = event->client;
+        load_mac_suffix_and_base();
+
         // Subscribe to system arm topic
-        esp_mqtt_client_subscribe(event->client, "greenhouse_esp/system/arm", 1);
+        char sys_arm_topic[96];
+        snprintf(sys_arm_topic, sizeof(sys_arm_topic), "%s/system/arm", s_base);
+        esp_mqtt_client_subscribe(event->client, sys_arm_topic, 1);
+
         // Subscribe to control topics per fan
         for (int i = 0; i < fan_count; ++i) {
             int fan_idx = fan_index_start + i;
-            char set_topic[64];
-            char pct_set_topic[64];
-            snprintf(set_topic, sizeof(set_topic), "greenhouse_esp/fan%d/set", fan_idx);
-            snprintf(pct_set_topic, sizeof(pct_set_topic), "greenhouse_esp/fan%d/percentage/set", fan_idx);
+            char set_topic[96];
+            char pct_set_topic[96];
+            snprintf(set_topic, sizeof(set_topic), "%s/fan/%d/set", s_base, fan_idx);
+            snprintf(pct_set_topic, sizeof(pct_set_topic), "%s/fan/%d/percentage/set", s_base, fan_idx);
             esp_mqtt_client_subscribe(event->client, set_topic, 1);
             esp_mqtt_client_subscribe(event->client, pct_set_topic, 1);
         }
-        // Publish discovery
-        mqtt = event->client;
+        // Publish discovery and initial states
         ha_publish_discovery();
         publish_states();
         break;
+    }
     case MQTT_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "MQTT disconnected - stopping all motors for safety");
+        ESP_LOGW(TAG, "MQTT disconnected - ramping motors to 0 for safety");
         s_mqtt_connected = false;
-        // Safety: stop all motors on MQTT disconnect
-        for (int i = 0; i < fan_count; ++i) {
-            motors[i].target_pct = 0;
-        }
-        // Publish availability offline if we can reconnect quickly
-        if (mqtt) {
-            uint8_t mac[6] = {0};
-            esp_wifi_get_mac(WIFI_IF_STA, mac);
-            char avail_topic[64];
-            snprintf(avail_topic, sizeof(avail_topic), "greenhouse_esp/status/%02X%02X%02X", mac[3], mac[4], mac[5]);
-            esp_mqtt_client_publish(mqtt, avail_topic, "offline", 0, 1, true);
-        }
+        for (int i = 0; i < fan_count; ++i) motors[i].target_pct = 0;
         break;
     case MQTT_EVENT_DATA: {
         char topic[256];
-        char *tgt = topic;
         int tlen = event->topic_len;
         if (tlen >= (int)sizeof(topic)) tlen = sizeof(topic) - 1;
-        memcpy(tgt, event->topic, tlen);
-        tgt[tlen] = 0;
-        // data is not null-terminated
+        memcpy(topic, event->topic, tlen);
+        topic[tlen] = 0;
+
         char data[64];
         int dlen = event->data_len;
         if (dlen >= (int)sizeof(data)) dlen = sizeof(data) - 1;
         memcpy(data, event->data, dlen);
         data[dlen] = 0;
+
         mqtt_on_message(topic, data, dlen);
         break; }
     default:
@@ -505,8 +563,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-static void wifi_init_sta(void)
-{
+static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_wifi_netif = esp_netif_create_default_wifi_sta();
@@ -525,7 +582,6 @@ static void wifi_init_sta(void)
     wifi_config_t wifi_config = { 0 };
     strlcpy((char *)wifi_config.sta.ssid, CONFIG_WIFI_SSID, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, CONFIG_WIFI_PASS, sizeof(wifi_config.sta.password));
-    // Allow WPA/WPA2; avoid forcing WPA3/SAE to reduce AUTH/HANDSHAKE issues on some APs
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
     wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
     wifi_config.sta.pmf_cfg.required = false; // PMF optional
@@ -537,7 +593,6 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // Improve latency/reliability of TCP/MQTT by disabling Wi‑Fi power save
-    // (can otherwise cause sporadic connect/select timeouts on some APs)
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     // Boost TX power for link robustness (units: 0.25 dBm, 84 => 21 dBm max)
     (void)esp_wifi_set_max_tx_power(84);
@@ -545,21 +600,20 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "wifi_init_sta finished, waiting for IP...");
 }
 
-static void mqtt_start(void)
-{
-    // Build unique client_id from MAC
-    uint8_t mac[6] = {0};
-    esp_wifi_get_mac(WIFI_IF_STA, mac);
-    static char client_id[32];
-    snprintf(client_id, sizeof(client_id), "greenhouse_esp_%02X%02X%02X", mac[3], mac[4], mac[5]);
+static void mqtt_start(void) {
+    load_mac_suffix_and_base();
 
-    char avail_topic[64];
-    snprintf(avail_topic, sizeof(avail_topic), "greenhouse_esp/status/%02X%02X%02X", mac[3], mac[4], mac[5]);
-    esp_mqtt_client_config_t cfg = (esp_mqtt_client_config_t) {
-    .broker.address.uri = CONFIG_MQTT_BROKER_URI,
-        .broker.address.port = 1883,
-    .credentials.username = CONFIG_MQTT_USERNAME,
-    .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
+    // Unique client_id from MAC
+    static char client_id[32];
+    snprintf(client_id, sizeof(client_id), "greenhouse_esp_%s", s_mac_suffix);
+
+    char avail_topic[96];
+    snprintf(avail_topic, sizeof(avail_topic), "%s/status", s_base);
+
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = CONFIG_MQTT_BROKER_URI, // do not override port; supports mqtt:// or mqtts://
+        .credentials.username = CONFIG_MQTT_USERNAME,
+        .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
         .credentials.client_id = client_id,
         .session.keepalive = 30,
         .network.reconnect_timeout_ms = 3000,
@@ -577,12 +631,11 @@ static void mqtt_start(void)
     esp_mqtt_client_start(mqtt);
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-{
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
         case WIFI_EVENT_STA_START:
-            ESP_LOGI(TAG, "Wi‑Fi start, connecting...\n");
+            ESP_LOGI(TAG, "Wi‑Fi start, connecting...");
             esp_wifi_connect();
             break;
         case WIFI_EVENT_STA_CONNECTED:
@@ -608,7 +661,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                     case 202: reason_str = "AUTH_FAIL"; break;
                     case 203: reason_str = "ASSOC_FAIL"; break;
                     case 204: reason_str = "HANDSHAKE_TIMEOUT"; break;
-                    case 205: reason_str = "CONNECTION_FAIL"; break; // often WPA/PMF/SAE mismatch
+                    case 205: reason_str = "CONNECTION_FAIL"; break;
                     default: reason_str = "OTHER"; break;
                 }
             }
@@ -619,7 +672,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                 motors[i].target_pct = 0;
             }
             esp_wifi_connect();
-            xEventGroupClearBits(s_wifi_event_group, WIFI_GOT_IP_BIT);
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
             break; }
         default:
             break;
@@ -632,8 +685,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }
 }
 
-static void dshot_init_motor(motor_ctx_t *m, int gpio, uint32_t baud)
-{
+static void dshot_init_motor(motor_ctx_t *m, int gpio, uint32_t baud) {
     m->gpio = gpio;
 
     rmt_tx_channel_config_t tx_cfg = {
@@ -648,8 +700,8 @@ static void dshot_init_motor(motor_ctx_t *m, int gpio, uint32_t baud)
 
     dshot_esc_encoder_config_t enc_cfg = {
         .resolution = DSHOT_ESC_RESOLUTION_HZ,
-        .baud_rate = 600000, // default DSHOT600
-        .post_delay_us = 50,
+        .baud_rate = 600000, // DSHOT600
+        .post_delay_us = 100,
     };
     ESP_ERROR_CHECK(rmt_new_dshot_esc_encoder(&enc_cfg, &m->enc600));
     m->active_enc = m->enc600; // fixed DSHOT600
@@ -663,11 +715,9 @@ static void dshot_init_motor(motor_ctx_t *m, int gpio, uint32_t baud)
     m->last_tx_us = 0;
     m->rmt_refresh_count = 0;
     m->stopped = true; // start with RMT TX stopped
-    // Don't call motor_apply here - wait for safety checks to pass
 }
 
-static void motor_ramp_task(void *arg)
-{
+static void motor_ramp_task(void *arg) {
     (void)arg;
     while (1) {
         for (int i = 0; i < fan_count; ++i) {
@@ -695,7 +745,7 @@ static void motor_ramp_task(void *arg)
                     motors[i].last_reported_pct = motors[i].current_pct;
                 }
             } else {
-                // Even if target is steady, periodically refresh the stream
+                // Even if target is steady, avoid churn; a rare watchdog refresh happens in motor_apply
                 motor_apply(&motors[i]);
             }
         }
@@ -703,8 +753,7 @@ static void motor_ramp_task(void *arg)
     }
 }
 
-void app_main(void)
-{
+void app_main(void) {
     ESP_LOGI(TAG, "Init NVS");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -715,7 +764,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Init modular config");
     parse_dshot_gpios();
-    
+
     // Initialize DShot frame cache for optimized performance
     ESP_LOGI(TAG, "Init DShot frame cache");
     init_dshot_frame_cache();
@@ -733,31 +782,22 @@ void app_main(void)
     for (int i = 0; i < fan_count; ++i) {
         dshot_init_motor(&motors[i], dshot_gpios[i], 600000);
     }
-    
+
     // Initialize last command time
     s_last_command_time = esp_timer_get_time();
-    
+
     // Start ramp controller task (high-ish priority to keep updates smooth)
     xTaskCreatePinnedToCore(motor_ramp_task, "motor_ramp", 3072, NULL, 18, NULL, 0);
-    // Telemetry removed: no telemetry task
 
     ESP_LOGI(TAG, "Setup complete - system %s", s_system_armed ? "ARMED" : "DISARMED");
 
-    // Heartbeat task: periodically publish states and check failsafe
+    // Heartbeat task: periodically publish states and metrics
     while (1) {
         if (mqtt && s_mqtt_connected) {
             publish_states();
             publish_metrics();
         }
-        
-        // Check failsafe timeout
-        if (!safety_check()) {
-            // Safety already handled in motor_apply
-        }
-        
+        // Failsafe is enforced in motor_apply
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
-
-// (Telemetry task removed)
-
